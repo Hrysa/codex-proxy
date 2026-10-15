@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-host-proxy"
+version = "0.1.0"
+description = "Token-protected Responses API proxy using a host Codex login and configuration"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+codex-proxy = "codex_proxy:main"
+
+[tool.setuptools]
+py-modules = ["codex_proxy"]
