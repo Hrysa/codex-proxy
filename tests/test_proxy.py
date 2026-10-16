@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -85,7 +86,7 @@ class Upstream(BaseHTTPRequestHandler):
     def handle(self):
         try:
             super().handle()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass  # Expected when testing client cancellation or header rejection.
 
     def log_message(self, *args):
@@ -211,6 +212,7 @@ class ProxyTests(unittest.TestCase):
             response = self.request()
             body = response.read()
         self.assertIn(b'"code": "proxy_incomplete_stream"', body)
+        self.assertIn(b'"type": "response.failed"', body)
         self.assertNotIn(b'"type":"response.completed"', body)
         self.assertIn("terminal=missing", logs.output[0])
         self.assertIn("last=response.created", logs.output[0])
@@ -290,8 +292,49 @@ class ProxyTests(unittest.TestCase):
 
     def test_upstream_failure_event_is_preserved(self):
         self.up.custom_body = b'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"test_error","message":"test failure"}}}\n\n'
-        response = self.request()
-        self.assertEqual(response.read(), self.up.custom_body)
+        with self.assertLogs(proxy.LOG, level="WARNING") as logs:
+            response = self.request()
+            self.assertEqual(response.read(), self.up.custom_body)
+        self.assertIn("error_code=test_error", logs.output[-1])
+        self.assertNotIn("test failure", "\n".join(logs.output))
+
+    def test_headerless_sse_error_logs_code_without_message_or_retry(self):
+        self.up.content_type = None
+        for error in [
+            {"type": "error", "code": "context_length_exceeded", "message": "private conversation"},
+            {"type": "error", "error": {"code": "invalid_encrypted_content",
+                                        "type": "invalid_request_error", "message": "private conversation"}},
+        ]:
+            with self.subTest(error=error):
+                self.up.custom_body = b'data: ' + json.dumps(error).encode() + b'\n\n'
+                before = len(self.up.requests)
+                with self.assertLogs(proxy.LOG, level="WARNING") as logs:
+                    response = self.request()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
+                    body = response.read()
+                    self.assertTrue(body.startswith(self.up.custom_body))
+                    failure = json.loads(body.split(b"data: ")[-1].strip())
+                    self.assertEqual(failure["type"], "response.failed")
+                    self.assertEqual(failure["response"]["status"], "failed")
+                    self.assertEqual(failure["response"]["error"], error.get("error", error))
+                    self.assertNotIn(b"response.completed", body)
+                expected_code = error.get("error", error)["code"]
+                self.assertIn(f"error_code={expected_code}", logs.output[-1])
+                self.assertIn("terminal=error", logs.output[-1])
+                self.assertNotIn("private conversation", "\n".join(logs.output))
+                self.assertEqual(len(self.up.requests), before + 1)
+
+    def test_nested_internal_error_without_final_delimiter_is_visible_to_codex(self):
+        error = {"type": "internal_error", "message": "Upstream could not process this history"}
+        self.up.custom_body = b'data: ' + json.dumps({"type": "error", "error": error}).encode()
+        body = self.request().read()
+        self.assertTrue(body.startswith(self.up.custom_body + b"\n\n"))
+        failed = json.loads(body.split(b"data: ")[-1].strip())
+        self.assertEqual(failed["type"], "response.failed")
+        self.assertEqual(failed["response"]["error"], error)
+        self.assertEqual(body.count(b'"type": "response.failed"'), 1)
+        self.assertNotIn(b"response.completed", body)
 
     def test_nonstreaming_json_response_still_passes_through(self):
         self.up.content_type = "application/json"
@@ -326,6 +369,51 @@ class ProxyTests(unittest.TestCase):
         self.assertTrue(self.up.requests[0][0].endswith("/models?client_version=1"))
         self.assertTrue(self.up.requests[1][0].endswith("/responses/compact"))
 
+    def test_compaction_json_and_followup_preserve_encrypted_items(self):
+        body = b'{"model":"host-model","input":[{"role":"user","content":"private history"}]}'
+        compacted = {"id": "cmp_test", "object": "response.compaction", "output": [
+            {"type": "compaction", "encrypted_content": "opaque-private-content"}]}
+        self.up.content_type = "application/json"
+        self.up.encoding = "gzip"
+        payload = json.dumps(compacted).encode()
+        self.up.custom_body = gzip.compress(payload)
+        response = self.request(path="/v1/responses/compact", body=body)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader("Content-Type"), "application/json")
+        self.assertIsNone(response.getheader("Content-Encoding"))
+        self.assertEqual(response.read(), payload)
+        self.assertEqual(self.up.requests[-1][2], body)
+        self.assertEqual(self.up.requests[-1][0], "/backend-api/codex/responses/compact")
+        self.up.content_type, self.up.encoding, self.up.custom_body = "text/event-stream", None, None
+        followup = json.dumps({"model": "host-model", "stream": True, "input": compacted["output"]}).encode()
+        self.assertIn(b"response.completed", self.request(body=followup).read())
+        self.assertEqual(self.up.requests[-1][2], followup)
+
+    def test_compaction_http_error_is_logged_and_preserved(self):
+        self.up.status = 400
+        self.up.content_type = "application/json"
+        self.up.encoding = "gzip"
+        payload = b'{"error":{"code":"context_length_exceeded","type":"invalid_request_error","message":"private history"}}'
+        self.up.custom_body = gzip.compress(payload)
+        with self.assertLogs(proxy.LOG, level="WARNING") as logs:
+            response = self.request(path="/v1/responses/compact", body=b'{}')
+            self.assertEqual(response.status, 400)
+            self.assertEqual(response.read(), payload)
+        self.assertIn("POST /responses/compact -> 400", logs.output[-1])
+        self.assertIn("error_code=context_length_exceeded error_type=invalid_request_error", logs.output[-1])
+        self.assertNotIn("private history", "\n".join(logs.output))
+
+    def test_compaction_refresh_failure_logs_route_and_reason(self):
+        self.up.status = 401
+        with patch.object(proxy, "refresh_login", side_effect=proxy.ConfigError("Cannot start codex to refresh host login; check --codex-bin")):
+            with self.assertLogs(proxy.LOG, level="WARNING") as logs:
+                response = self.request(path="/v1/responses/compact", body=b'{}')
+                self.assertEqual(response.status, 503)
+                response.read()
+        self.assertIn("POST /responses/compact -> 503", logs.output[-1])
+        self.assertIn("reason=Cannot start codex", logs.output[-1])
+        self.assertNotIn("host-access", "\n".join(logs.output))
+
     def test_host_catalog_preserves_metadata_without_cache_identity(self):
         models = [{"slug": "host-model", "context_window": 500000, "supported_reasoning_levels": []}]
         (self.home / "models_cache.json").write_text(json.dumps({"models": models,
@@ -344,6 +432,41 @@ class ProxyTests(unittest.TestCase):
         response = self.request("GET", "/v1/codex-models", None)
         self.assertEqual(response.status, 503)
         self.assertIn(b"Host Codex model catalog is unavailable", response.read())
+
+    def test_missing_catalog_fetches_upstream_metadata_with_host_credentials(self):
+        models = [{"slug": "host-model", "context_window": 272000, "auto_compact_token_limit": 240000}]
+        self.up.content_type = "application/json"
+        self.up.encoding = "gzip"
+        self.up.custom_body = gzip.compress(json.dumps({"models": models, "identity": "private-account"}).encode())
+        response = self.request("GET", "/v1/codex-models?client_version=0.162.1&ignored=private", None)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.read()), {"models": models})
+        path, headers, body = self.up.requests[-1]
+        self.assertEqual(path, "/backend-api/codex/models?client_version=0.162.1")
+        self.assertEqual(headers["Authorization"], "Bearer host-access")
+        self.assertEqual(headers["Accept"], "application/json")
+        self.assertEqual(body, b"")
+        self.assertFalse((self.home / "models_cache.json").exists())
+
+    def test_upstream_catalog_rejects_generic_model_list(self):
+        self.up.content_type = "application/json"
+        self.up.custom_body = b'{"data":[{"id":"host-model"}]}'
+        response = self.request("GET", "/v1/codex-models", None)
+        self.assertEqual(response.status, 503)
+        self.assertIn(b"valid Codex catalog", response.read())
+
+    def test_catalog_upstream_http_error_is_not_accepted_as_metadata(self):
+        self.up.status = 429
+        response = self.request("GET", "/v1/codex-models", None)
+        self.assertEqual(response.status, 503)
+        self.assertIn(b"upstream /models returned HTTP 429", response.read())
+
+    def test_invalid_explicit_catalog_does_not_silently_change_source(self):
+        self.provider.config["model_catalog_json"] = "missing-explicit.json"
+        response = self.request("GET", "/v1/codex-models", None)
+        self.assertEqual(response.status, 503)
+        self.assertIn(b"configured model_catalog_json", response.read())
+        self.assertEqual(self.up.requests, [])
 
     def test_explicit_host_catalog_takes_priority_over_cache(self):
         (self.home / "explicit.json").write_text(json.dumps({"models": [{"slug": "explicit-model"}]}))
@@ -527,6 +650,13 @@ refresh_interval_ms = 0
 
 
 class StreamFramingTests(unittest.TestCase):
+    def test_error_identifiers_reject_freeform_and_malformed_fields(self):
+        for payload in [None, [], {"error": "private message"}]:
+            self.assertEqual(proxy.error_identifiers(payload), ("none", "none"))
+        self.assertEqual(proxy.error_identifiers({"error": {"code": "private\nmessage", "type": {"secret": 1}}}),
+                         ("unknown", "unknown"))
+        self.assertEqual(proxy.error_identifiers({"code": "x" * 101}), ("unknown", "none"))
+
     def test_dns_failure_reason_is_specific_without_logging_arbitrary_exception_text(self):
         error = proxy.URLError(socket.gaierror(-8, "private-diagnostic-data"))
         reason = proxy.stream_error_reason(error)
@@ -586,7 +716,6 @@ class RefreshProtocolTests(unittest.TestCase):
     def test_real_subprocess_rpc_handshake_and_cleanup(self):
         with tempfile.TemporaryDirectory() as temp:
             executable = Path(temp) / "fake-codex"
-            import sys
             executable.write_text(f'''#!{sys.executable}
 import json,sys
 assert sys.argv[1:] == ['app-server', '-c', 'cli_auth_credentials_store="file"']
@@ -600,7 +729,12 @@ print(json.dumps({{'id':2,'result':{{'account':{{'type':'chatgpt'}}}}}}), flush=
 sys.stdin.read()
 ''')
             executable.chmod(0o700)
-            proxy.refresh_login(str(executable), Path(temp), timeout=3)
+            # Windows cannot execute a shebang script directly. Still exercise a
+            # real subprocess and the same RPC protocol on every platform.
+            popen = proxy.subprocess.Popen
+            with patch.object(proxy.subprocess, "Popen", side_effect=lambda args, **kwargs:
+                              popen([sys.executable, *args], **kwargs)):
+                proxy.refresh_login(str(executable), Path(temp), timeout=3)
 
 
 if __name__ == "__main__":

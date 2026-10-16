@@ -102,16 +102,17 @@ API routes require `Authorization: Bearer sk-codex-proxy`; `/healthz` does not. 
 
 Host credentials replace the client's proxy key before forwarding. Credentials reload on each request; expired ChatGPT logins are renewed through `codex app-server`. OS-keyring-only and ephemeral credentials are unsupported. Run one proxy process per host login to avoid competing token refreshes.
 
-The metadata endpoint serves the host's configured `model_catalog_json`, or the models from `models_cache.json`, without cache identity fields. Tool and conversation payloads pass through; the proxy does not run jobs on the host. Logs include stream diagnostics, but not tokens or conversation payloads.
+The metadata endpoint serves the host's configured `model_catalog_json`, or the models from `models_cache.json`, without cache identity fields. If the default cache is missing or invalid, it fetches the upstream `/models` using host credentials and the client's version. The upstream must return a Codex catalog with `models` and `slug` fields; a generic API model list cannot provide context limits. An explicitly configured catalog must be valid. Tool and conversation payloads pass through; the proxy does not run jobs on the host. Logs include stream diagnostics, but not tokens or conversation payloads.
 
 Upstream connections respect `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and `CODEX_CA_CERTIFICATE`.
 
 ## Troubleshooting
 
-- **Old sessions fail, new sessions work:** start a new session after switching to the proxy. Try this before changing model or transport settings.
+- **Old sessions fail, new sessions work:** after switching to the proxy, use `/new` and send a short message before changing model or transport settings. Resuming or forking the old conversation retains its history, which may contain encrypted state the host's upstream cannot accept. If a fresh chat works, transfer a plain-text task summary into it, or continue the old chat with its original provider/account. An `internal_error` alone does not prove encrypted state caused the failure.
 - **Missing model metadata:** confirm the client has the printed `model_catalog_url`. Run Codex on the host if its model cache is missing. For clients needing a local catalog, follow the download instructions printed at proxy startup.
 - **Client cannot parse the catalog:** align the client and host Codex versions.
 - **Stream disconnects:** inspect the host log. `terminal=response.completed` indicates completion; `terminal=missing` indicates an incomplete stream. Early failures include upstream status, encoding, and `reason=...`.
+- **Failures during or after compaction:** compare `/compact` in a new proxy conversation with the old conversation. If only the old conversation fails, its history is involved; this alone cannot distinguish incompatible carried-over state from a size limit. Check whether the failing route is `/responses/compact` or `/responses`. Host configuration/authentication failures include `reason=...`; upstream failures include `error_code` and `error_type` when available. `terminal=error` means the upstream sent an error, even when HTTP status is 200. The proxy preserves that event and appends `response.failed` so Codex can display the upstream message instead of a generic disconnect. Proxy-generated stream failures also use `response.failed`. Error messages are sent to the authenticated client, but are not logged.
 
 Check that the server is running with:
 

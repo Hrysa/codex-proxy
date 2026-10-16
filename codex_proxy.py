@@ -45,6 +45,24 @@ class StreamError(Exception):
     pass
 
 
+def error_identifiers(payload) -> tuple[str, str]:
+    """Extract bounded error identifiers, never free-form messages or payloads."""
+    if not isinstance(payload, dict):
+        return "none", "none"
+    if isinstance(payload.get("response"), dict):
+        payload = payload["response"]
+    error = payload.get("error", payload)
+    if not isinstance(error, dict):
+        return "none", "none"
+
+    def identifier(value):
+        if value is None:
+            return "none"
+        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", value) else "unknown"
+
+    return identifier(error.get("code")), identifier(error.get("type"))
+
+
 class SSEMonitor:
     """Observe framing and event types without logging conversation payloads."""
 
@@ -53,6 +71,9 @@ class SSEMonitor:
         self.events = 0
         self.last_event = "none"
         self.terminal = None
+        self.error_code = "none"
+        self.error_type = "none"
+        self.failure_error = None
 
     def feed(self, chunk: bytes):
         self.pending = (self.pending + chunk).replace(b"\r\n", b"\n")
@@ -79,6 +100,12 @@ class SSEMonitor:
             self.last_event = event if isinstance(event, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", event) else "unknown"
             if self.last_event in {"response.completed", "response.failed", "error"} and isinstance(payload, dict) and payload.get("type") == self.last_event:
                 self.terminal = self.last_event
+                if self.terminal in {"response.failed", "error"}:
+                    self.error_code, self.error_type = error_identifiers(payload)
+                if self.terminal == "error":
+                    error = payload.get("error", payload)
+                    self.failure_error = dict(error) if isinstance(error, dict) else {
+                        "message": "Upstream emitted an error event"}
         if len(self.pending) > MAX_BODY:
             raise StreamError("Upstream SSE event exceeds 64 MiB")
 
@@ -184,22 +211,46 @@ class HostProvider:
         except (OSError, ValueError):
             raise ConfigError("Cannot read host auth.json; check the host's file-based Codex login") from None
 
-    def model_catalog(self) -> dict:
+    def model_catalog(self, query: str = "", timeout: float = 300) -> dict:
         configured = self.config.get("model_catalog_json")
         path = Path(configured).expanduser() if configured else self.home / "models_cache.json"
         if configured and not path.is_absolute():
             path = self.home / path
-        try:
-            catalog = json.loads(path.read_text())
+        def validated(catalog):
             models = catalog.get("models") if isinstance(catalog, dict) else None
             if not isinstance(models, list) or not models or any(
                 not isinstance(model, dict) or not isinstance(model.get("slug"), str) for model in models
             ):
                 raise ValueError
+            # Cache and upstream envelopes can contain account identity fields.
+            return {"models": models}
+
+        try:
+            return validated(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, ValueError):
-            raise ConfigError("Host Codex model catalog is unavailable. Run Codex on the host to populate models_cache.json, or set model_catalog_json in the host config") from None
-        # The cache also contains identity and account information; export only metadata.
-        return {"models": models}
+            if configured:
+                raise ConfigError("Host configured model_catalog_json is unavailable or invalid; check that file") from None
+
+        # Headless hosts may have credentials without ever creating models_cache.json.
+        # Fetch metadata with host credentials; never invent context-window values.
+        params = [(name, value) for name, value in parse_qsl(query) if name == "client_version"]
+        upstream = self.request("/models", urlencode(params), None, {"Accept": "application/json"}, timeout)
+        try:
+            if upstream.status != 200:
+                raise ConfigError(f"Host Codex model catalog is unavailable: upstream /models returned HTTP {upstream.status}")
+            encoding = upstream.headers.get("Content-Encoding", "identity").strip().lower() or "identity"
+            if encoding not in {"identity", "gzip", "x-gzip", "deflate"}:
+                raise ConfigError("Host Codex model catalog is unavailable: unsupported upstream encoding")
+            data = bytearray()
+            for chunk in response_chunks(upstream, encoding):
+                if len(data) + len(chunk) > MAX_BODY:
+                    raise ValueError
+                data.extend(chunk)
+            return validated(json.loads(data))
+        except (ValueError, zlib.error, StreamError):
+            raise ConfigError("Host Codex model catalog is unavailable: upstream /models did not return a valid Codex catalog. Set model_catalog_json to a valid host catalog") from None
+        finally:
+            upstream.close()
 
     def credentials(self) -> tuple[str, dict[str, str], bool]:
         p = self.provider
@@ -430,9 +481,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def write_stream_error(self, message: str):
-        event = {"type": "error", "code": "proxy_incomplete_stream", "message": message,
-                 "param": None, "sequence_number": 0}
-        self.write_stream_chunk(b"\n\nevent: error\ndata: " + json.dumps(event).encode() + b"\n\n")
+        self.write_response_failure({"code": "proxy_incomplete_stream", "message": message})
+
+    def write_response_failure(self, error: dict):
+        # Codex's HTTP parser ignores generic `error` events, but classifies
+        # response.failed and preserves its upstream error message and code.
+        event = {"type": "response.failed", "response": {"status": "failed", "error": error}}
+        self.write_stream_chunk(b"\n\nevent: response.failed\ndata: " + json.dumps(event).encode() + b"\n\n")
 
     def proxy(self):
         authorization = self.headers.get("Authorization", "")
@@ -472,6 +527,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         content_type = "unknown"
         encoding = "unknown"
         status = "unavailable"
+        error_body = bytearray()
         try:
             body = self.rfile.read(length) if length else None
             if body is not None and len(body) != length:
@@ -484,7 +540,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.json_error(400, "GET request bodies are unsupported")
                 return
             if route == "/codex-models":
-                catalog = json.dumps(self.server.provider.model_catalog()).encode()
+                catalog = json.dumps(self.server.provider.model_catalog(parts.query, self.server.upstream_timeout)).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(catalog)))
@@ -553,6 +609,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     monitor.feed(chunk)
                     self.write_stream_chunk(chunk)
                 else:
+                    if status >= 400 and len(error_body) <= 65536:
+                        error_body.extend(chunk[:65537 - len(error_body)])
                     self.wfile.write(chunk)
                     self.wfile.flush()
                 bytes_sent += len(chunk)
@@ -567,23 +625,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     self.write_stream_error("Upstream closed before a terminal Responses event "
                                             f"(events={monitor.events}, last={monitor.last_event}, request_id={request_id}). "
                                             "Check the host proxy log for stream diagnostics.")
+                elif monitor.terminal == "error":
+                    # Keep the original event and append a failure Codex understands.
+                    # Never turn an upstream error into a successful completion.
+                    self.write_response_failure(monitor.failure_error)
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
                 log = LOG.info if monitor.terminal == "response.completed" else LOG.warning
-                log("%s %s -> %s bytes=%s events=%s last=%s terminal=%s encoding=%s request_id=%s",
+                log("%s %s -> %s bytes=%s events=%s last=%s terminal=%s encoding=%s request_id=%s error_code=%s error_type=%s",
                     self.command, route, status, bytes_sent, monitor.events, monitor.last_event,
-                    monitor.terminal or "missing", encoding, request_id)
+                    monitor.terminal or "missing", encoding, request_id, monitor.error_code, monitor.error_type)
             else:
-                LOG.info("%s %s -> %s bytes=%s encoding=%s request_id=%s", self.command, route,
-                         status, bytes_sent, encoding, request_id)
+                error_code, error_type = "none", "none"
+                if error_body and len(error_body) <= 65536:
+                    try:
+                        error_code, error_type = error_identifiers(json.loads(error_body))
+                    except (ValueError, UnicodeError):
+                        pass
+                log = LOG.warning if status >= 400 else LOG.info
+                log("%s %s -> %s bytes=%s encoding=%s request_id=%s error_code=%s error_type=%s",
+                    self.command, route, status, bytes_sent, encoding, request_id, error_code, error_type)
         except ConfigError as error:
-            LOG.warning("Host configuration/authentication error")
+            LOG.warning("%s %s -> 503 Host configuration/authentication error reason=%s",
+                        self.command, route, error)
             if not started:
                 self.json_error(503, str(error))
         except (URLError, OSError, ValueError, HTTPException, StreamError, zlib.error) as error:
             reason = stream_error_reason(error)
-            LOG.warning("Stream/connection failed (%s) status=%s bytes=%s events=%s last=%s content_type=%s encoding=%s request_id=%s reason=%s",
-                        type(error).__name__, status, bytes_sent, monitor.events if monitor else 0,
+            LOG.warning("%s %s Stream/connection failed (%s) status=%s bytes=%s events=%s last=%s content_type=%s encoding=%s request_id=%s reason=%s",
+                        self.command, route, type(error).__name__, status, bytes_sent, monitor.events if monitor else 0,
                         monitor.last_event if monitor else "none", content_type, encoding, request_id, reason)
             if not started:
                 try:
