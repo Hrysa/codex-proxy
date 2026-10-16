@@ -680,7 +680,8 @@ def client_config(model: str, base_url: str) -> str:
             '[model_providers.codex_proxy]\nname = "Host Codex proxy"\n'
             f'base_url = {json.dumps(base_url)}\nexperimental_bearer_token = {json.dumps(PROXY_KEY)}\n'
             f'model_catalog_url = {json.dumps(catalog_url)}\n'
-            'wire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false')
+            'wire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\n'
+            'capabilities.remote_compaction = "v2"')
 
 
 def detect_lan_ip() -> str:
@@ -735,24 +736,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex-home", type=Path, default=Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")))
     parser.add_argument("--profile", help="Host Codex profile (new file or legacy profiles table)")
-    commands = parser.add_subparsers(dest="command", required=True)
-    serve = commands.add_parser("serve", help="Expose the host's model provider")
-    serve.add_argument("--port", type=int, default=8787)
-    serve.add_argument("--upstream-timeout", type=float, default=300)
-    serve.add_argument("--codex-bin", default="codex", help="Codex executable for login renewal")
-    client = commands.add_parser("client-config", help="Print a standard client config.toml snippet")
-    client.add_argument("--base-url", help="Defaults to the detected LAN IP on port 8787")
-    client.add_argument("--model", help="Defaults to the host config model")
+    parser.add_argument("--port", type=int, default=8787)
+    parser.add_argument("--upstream-timeout", type=float, default=300)
+    parser.add_argument("--codex-bin", default="codex", help="Codex executable for login renewal")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
-        if args.command == "client-config":
-            model = args.model or read_config(args.codex_home, args.profile).get("model")
-            if not model:
-                raise ConfigError("Supply --model or set model in the host config.toml")
-            base = validate_url(args.base_url or f"http://{detect_lan_ip()}:8787/v1")
-            print(client_config(model, base))
-            return 0
         if args.upstream_timeout <= 0:
             raise ConfigError("--upstream-timeout must be positive")
         provider = HostProvider(args.codex_home, args.profile, args.codex_bin)

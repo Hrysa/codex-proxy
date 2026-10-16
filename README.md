@@ -1,147 +1,62 @@
 # Codex host proxy
 
-Share a host machine's Codex model access with another machine through a Responses API. The client uses its standard `~/.codex/config.toml`; commands, file edits, approvals, and MCP tools run on the client.
-
-```text
-Client Codex → host proxy → host credentials → LLM
-```
+Share a host machine's Codex model access with another machine. Commands, file edits, approvals, and MCP tools run on the client.
 
 The host needs Python 3.11+ and Codex CLI. There are no Python runtime dependencies. The client needs Codex CLI.
 
-## Host setup
-
-The proxy reads `config.toml` and `auth.json` from `$CODEX_HOME`, defaulting to `~/.codex`. It supports file-based ChatGPT or API-key logins and custom Responses providers.
-
-If the host is already logged in and `auth.json` exists, start the proxy:
+## Start the host
 
 ```sh
-./run.sh serve
+python codex_proxy.py
 ```
 
-For a new login or credentials stored only in the OS keyring, log in with file storage first:
+The proxy reads the host's `~/.codex/config.toml` and `auth.json` (or `$CODEX_HOME`), listens on `0.0.0.0:8787`, and prints client setup with the detected LAN IP and host model.
+
+If the host needs to log in, or its credentials are stored only in the OS keyring, first run:
 
 ```sh
 codex -c 'cli_auth_credentials_store="file"' login
 ```
 
-The server listens on `0.0.0.0:8787` and prints client instructions using its detected LAN IP and configured model. The built-in API key is `sk-codex-proxy`; no token environment variable is required.
+File-based ChatGPT and API-key logins and custom Responses providers are supported. Credentials reload on each request; expired ChatGPT logins renew automatically. Restart after changing host configuration.
 
-The key is shared across installations. Use a trusted network, SSH tunnel, or HTTPS reverse proxy. Plain HTTP does not encrypt conversations or the key.
+The built-in API key is `sk-codex-proxy`, shared across installations. Use a trusted network, SSH tunnel, or HTTPS reverse proxy; plain HTTP does not encrypt conversations or the key.
 
-## Client setup
+## Connect the client
 
-Merge the configuration printed by the host into the client's `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`). Replace existing keys instead of duplicating them, and put root keys before TOML tables.
+1. Merge the TOML printed by the host into the client's `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`). Replace existing keys and put root keys before tables.
+2. Start `codex` on the client.
 
-For example, with a host at `192.168.1.10`:
+The client needs no OpenAI login or copy of the host's credentials. Its sandbox and approval settings still apply.
 
-```toml
-model = "YOUR_HOST_MODEL"
-model_provider = "codex_proxy"
+The printed provider config includes `capabilities.remote_compaction = "v2"` to send compaction triggers through Responses. For an existing client config, add that line under `[model_providers.codex_proxy]` and restart Codex. If the host uses a custom upstream without v2 compaction support, set it to `"unsupported"` to use local compaction. See the [official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 
-[model_providers.codex_proxy]
-name = "Host Codex proxy"
-base_url = "http://192.168.1.10:8787/v1"
-experimental_bearer_token = "sk-codex-proxy"
-model_catalog_url = "http://192.168.1.10:8787/v1/codex-models"
-wire_api = "responses"
-requires_openai_auth = false
-supports_websockets = false
-```
-
-Use the address and model printed by your host, then start a new client session:
-
-```sh
-codex
-```
-
-The client does not need an OpenAI login or a copy of the host's credentials. Its sandbox and approval settings still apply.
-
-To print the client configuration separately on the host:
-
-```sh
-./run.sh client-config
-```
+For an SSH tunnel, run `ssh -N -L 8787:127.0.0.1:8787 user@HOST` on the client and use `http://127.0.0.1:8787/v1` as `base_url` and `http://127.0.0.1:8787/v1/codex-models` as `model_catalog_url`.
 
 ## Options
 
-| Purpose | Command |
-| --- | --- |
-| Change the listening port | `./run.sh serve --port 9000` |
-| Use another Codex home | `./run.sh --codex-home /path/to/.codex serve` |
-| Select a host profile | `./run.sh --profile work serve` |
-| Change the client endpoint | `./run.sh client-config --base-url https://proxy.example.com/v1` |
-| Choose a client model | `./run.sh client-config --model YOUR_MODEL` |
-| Set the Codex executable | `./run.sh serve --codex-bin /path/to/codex` |
-| Set the upstream idle timeout | `./run.sh serve --upstream-timeout 300` |
-
-Profiles support `<name>.config.toml` files and legacy `[profiles.<name>]` tables. Restart the proxy after changing host configuration. When changing the listening port, use that port in the client URLs too.
-
-For an SSH tunnel, run this on the client and leave it open:
-
 ```sh
-ssh -N -L 8787:127.0.0.1:8787 user@HOST
+python codex_proxy.py --port 9000
+python codex_proxy.py --codex-home /path/to/.codex --profile work
+python codex_proxy.py --help
 ```
 
-Generate the corresponding client configuration on the host:
-
-```sh
-./run.sh client-config --base-url http://127.0.0.1:8787/v1
-```
-
-## API and behavior
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| POST | `/v1/responses` | Model requests with HTTP streaming |
-| POST | `/v1/responses/compact` | Conversation compaction |
-| GET | `/v1/models` | Upstream model list |
-| GET | `/v1/codex-models` | Host's Codex model metadata |
-| GET | `/healthz` | Proxy liveness |
-
-API routes require `Authorization: Bearer sk-codex-proxy`; `/healthz` does not. The `/v1` prefix is optional for API routes. WebSocket transport is not supported. Request bodies are limited to 64 MiB.
-
-Host credentials replace the client's proxy key before forwarding. Credentials reload on each request; expired ChatGPT logins are renewed through `codex app-server`. OS-keyring-only and ephemeral credentials are unsupported. Run one proxy process per host login to avoid competing token refreshes.
-
-The metadata endpoint serves the host's configured `model_catalog_json`, or the models from `models_cache.json`, without cache identity fields. If the default cache is missing or invalid, it fetches the upstream `/models` using host credentials and the client's version. The upstream must return a Codex catalog with `models` and `slug` fields; a generic API model list cannot provide context limits. An explicitly configured catalog must be valid. Tool and conversation payloads pass through; the proxy does not run jobs on the host. Logs include stream diagnostics, but not tokens or conversation payloads.
-
-Upstream connections respect `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and `CODEX_CA_CERTIFICATE`.
+Also available: `--codex-bin /path/to/codex` and `--upstream-timeout 300` (seconds). Profiles support `<name>.config.toml` files and `[profiles.<name>]` tables.
 
 ## Troubleshooting
 
-- **Old sessions fail, new sessions work:** after switching to the proxy, use `/new` and send a short message before changing model or transport settings. Resuming or forking the old conversation retains its history, which may contain encrypted state the host's upstream cannot accept. If a fresh chat works, transfer a plain-text task summary into it, or continue the old chat with its original provider/account. An `internal_error` alone does not prove encrypted state caused the failure.
-- **Missing model metadata:** confirm the client has the printed `model_catalog_url`. Run Codex on the host if its model cache is missing. For clients needing a local catalog, follow the download instructions printed at proxy startup.
-- **Client cannot parse the catalog:** align the client and host Codex versions.
-- **Stream disconnects:** inspect the host log. `terminal=response.completed` indicates completion; `terminal=missing` indicates an incomplete stream. Early failures include upstream status, encoding, and `reason=...`.
-- **Failures during or after compaction:** compare `/compact` in a new proxy conversation with the old conversation. If only the old conversation fails, its history is involved; this alone cannot distinguish incompatible carried-over state from a size limit. Check whether the failing route is `/responses/compact` or `/responses`. Host configuration/authentication failures include `reason=...`; upstream failures include `error_code` and `error_type` when available. `terminal=error` means the upstream sent an error, even when HTTP status is 200. The proxy preserves that event and appends `response.failed` so Codex can display the upstream message instead of a generic disconnect. Proxy-generated stream failures also use `response.failed`. Error messages are sent to the authenticated client, but are not logged.
+- **Connection fails:** check host reachability and `curl http://127.0.0.1:8787/healthz` on the host. This checks liveness; a client conversation verifies model access.
+- **Old sessions fail:** try `/new` and send a short message. If that works, transfer a plain-text task summary; old history may contain incompatible encrypted state.
+- **Missing model metadata:** use the printed `model_catalog_url` and fallback download instructions. Align client and host Codex versions if the catalog cannot be parsed.
+- **Stream or compaction failures:** inspect the host log. `terminal=response.completed` means completion; `terminal=missing` means an incomplete stream. Upstream failures include error identifiers when available. Compare with a fresh conversation if only old sessions fail.
+- **`response protection is unavailable` during compaction:** check that the client provider has `capabilities.remote_compaction = "v2"`, restart Codex, and retry. This selects the compaction protocol; it does not guarantee a fix for an upstream protection error. If it persists, inspect the host log and compare with a fresh conversation.
 
-Check that the server is running with:
-
-```sh
-curl http://127.0.0.1:8787/healthz
-```
-
-This checks liveness only. A successful client conversation verifies model access and streaming.
+The proxy supports HTTP Responses streaming, compaction, and model lists; WebSockets are unsupported. Upstream connections respect `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and `CODEX_CA_CERTIFICATE`.
 
 ## Development
 
-Run tests with a Python 3.11+ interpreter:
-
 ```sh
-python3 -m unittest discover -s tests -v
+python -m unittest discover -s tests -v
 ```
 
-If local network listeners are restricted, use socket pairs:
-
-```sh
-CODEX_PROXY_TEST_TRANSPORT=socketpair python3 -m unittest discover -s tests -v
-```
-
-Tests use temporary credentials and mock upstreams; they do not call the LLM or modify the host login.
-
-Optional package installation provides a `codex-proxy` command in place of `./run.sh`:
-
-```sh
-python3 -m pip install .
-```
-
-See OpenAI's [provider configuration](https://developers.openai.com/codex/config-advanced), [authentication](https://developers.openai.com/codex/auth), and [gateway requirements](https://learn.chatgpt.com/docs/enterprise/gateway-compatibility) for configuration details.
+Tests use temporary credentials and mock upstreams. If local listeners are restricted, prefix the command with `CODEX_PROXY_TEST_TRANSPORT=socketpair`.

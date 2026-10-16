@@ -570,10 +570,7 @@ query_params = {{ "api-version" = "host-version" }}
         self.assertEqual(proxy.read_config(self.home, "legacy")["model"], "legacy-model")
 
     def test_client_config_is_valid_toml_and_uses_host_model(self):
-        output = io.StringIO()
-        with patch("sys.stdout", output), patch.object(proxy, "detect_lan_ip", return_value="192.168.1.10"):
-            self.assertEqual(proxy.main(["--codex-home", str(self.home), "client-config"]), 0)
-        config = tomllib.loads(output.getvalue())
+        config = tomllib.loads(proxy.client_config(self.provider.config["model"], "http://192.168.1.10:8787/v1"))
         self.assertEqual(config["model"], "host-model")
         provider = config["model_providers"][config["model_provider"]]
         self.assertEqual(provider["experimental_bearer_token"], TOKEN)
@@ -582,14 +579,15 @@ query_params = {{ "api-version" = "host-version" }}
         self.assertNotIn("env_key", provider)
         self.assertFalse(provider["supports_websockets"])
         self.assertFalse(provider["requires_openai_auth"])
+        self.assertEqual(provider["capabilities"]["remote_compaction"], "v2")
 
-    def test_serve_prints_client_setup_with_bound_port(self):
+    def test_startup_prints_client_setup_with_bound_port(self):
         server = Mock(server_address=("0.0.0.0", 43210))
         server.serve_forever.side_effect = KeyboardInterrupt
         output = io.StringIO()
         with patch.object(proxy, "ProxyServer", return_value=server) as constructor, \
                 patch.object(proxy, "detect_lan_ip", return_value="192.168.1.10"), patch("sys.stdout", output):
-            self.assertEqual(proxy.main(["--codex-home", str(self.home), "serve", "--port", "0"]), 0)
+            self.assertEqual(proxy.main(["--codex-home", str(self.home), "--port", "0"]), 0)
         self.assertEqual(constructor.call_args.args[0], ("0.0.0.0", 0))
         text = output.getvalue()
         snippet = text.split("```toml\n", 1)[1].split("```", 1)[0]
@@ -603,6 +601,21 @@ query_params = {{ "api-version" = "host-version" }}
         self.assertIn("Then run on the client:\n  codex", text)
         self.assertNotIn("http://HOST", text)
         self.assertIn("'http://192.168.1.10:43210/v1/codex-models'", text)
+        server.server_close.assert_called_once()
+
+    def test_no_arguments_starts_server_using_codex_home(self):
+        server = Mock(server_address=("0.0.0.0", 8787))
+        server.serve_forever.side_effect = KeyboardInterrupt
+        with patch.dict(os.environ, {"CODEX_HOME": str(self.home)}), \
+                patch.object(proxy, "ProxyServer", return_value=server) as constructor, \
+                patch.object(proxy, "detect_lan_ip", return_value="192.168.1.10"), \
+                patch("sys.stdout", io.StringIO()):
+            self.assertEqual(proxy.main([]), 0)
+        address, provider, timeout = constructor.call_args.args
+        self.assertEqual(address, ("0.0.0.0", 8787))
+        self.assertEqual(provider.home, self.home)
+        self.assertEqual(timeout, 300)
+        server.serve_forever.assert_called_once()
         server.server_close.assert_called_once()
 
     def test_missing_login_is_clear(self):
